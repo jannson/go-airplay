@@ -23,6 +23,14 @@ extern void Go_callback();
 // Address as reported by Go will point to a go function wrapper rather than
 // the "real" address, so need this utility function.
 static void* addr() {return Go_callback;}
+
+#ifndef QUEUE_WRAP
+#define QUEUE_WRAP
+inline OSStatus audioQueueNewOutputWrap(AudioStreamBasicDescription* inFormat, void* p, AudioQueueRef* pqueue) {
+	return AudioQueueNewOutput(inFormat, Go_callback, p, NULL, NULL, 0, pqueue);
+}
+#endif
+
 */
 import "C"
 
@@ -42,12 +50,51 @@ const (
 
 type ALACPlayer struct {
 	queue     C.AudioQueueRef
+	cref      unsafe.Pointer
 	peeked    []byte
 	packetsin chan []byte
 	buffers   [alac_buffers]C.AudioQueueBufferRef
 	cookie    C.ALACMagicCookie
 	running   bool
 	sync.Mutex
+}
+
+type ReferenceMap struct {
+	mu   sync.Mutex
+	refs map[uintptr]interface{}
+	i    uintptr
+}
+
+func (refMap *ReferenceMap) getRef(v interface{}) unsafe.Pointer {
+	refMap.mu.Lock()
+	defer refMap.mu.Unlock()
+	p := refMap.i
+	refMap.refs[p] = v
+	refMap.i++
+	return unsafe.Pointer(p)
+}
+
+func (refMap *ReferenceMap) getVal(p unsafe.Pointer) interface{} {
+	refMap.mu.Lock()
+	defer refMap.mu.Unlock()
+	i := uintptr(p)
+	v, ok := refMap.refs[i]
+	if ok {
+		return v
+	}
+	return nil
+}
+
+func (refMap *ReferenceMap) close(p unsafe.Pointer) {
+	refMap.mu.Lock()
+	defer refMap.mu.Unlock()
+	i := uintptr(p)
+	delete(refMap.refs, i)
+}
+
+var globalRefs ReferenceMap = ReferenceMap{
+	refs: map[uintptr]interface{}{},
+	i:    1,
 }
 
 // This constructs the ALAC Magic cookie from the fmtp header
@@ -70,8 +117,12 @@ func magicCookieFromFmtp(fmtp []int) C.ALACMagicCookie {
 
 //export Go_callback
 func Go_callback(userdata unsafe.Pointer, queue C.AudioQueueRef, buffer C.AudioQueueBufferRef) {
-	log.Println("Go_callback")
-	p := (*ALACPlayer)(userdata)
+	//log.Println("Go_callback, userdata=", userdata)
+	p := globalRefs.getVal(userdata).(*ALACPlayer)
+	startCallback(p, queue, buffer)
+}
+
+func startCallback(p *ALACPlayer, queue C.AudioQueueRef, buffer C.AudioQueueBufferRef) {
 	audioData := ((*[1 << 30]byte)(unsafe.Pointer(buffer.mAudioData)))[:buffer.mAudioDataBytesCapacity]
 	pktDescs := (*[1 << 30]C.AudioStreamPacketDescription)(unsafe.Pointer(buffer.mPacketDescriptions))[:buffer.mPacketDescriptionCapacity]
 	npackets := 0
@@ -118,6 +169,7 @@ func (p *ALACPlayer) Close() error {
 		C.AudioQueueStop(p.queue, 1)
 		C.AudioQueueDispose(p.queue, 1)
 	}
+	globalRefs.close(p.cref)
 	return nil
 }
 
@@ -155,13 +207,12 @@ func (p *ALACPlayer) Setup(s *Session) error {
 	inFormat.mFormatID = C.kAudioFormatAppleLossless
 	inFormat.mFramesPerPacket = C.UInt32(ntohl(p.cookie.frameLength))
 	inFormat.mChannelsPerFrame = 2 // Stero TODO: get from fmtp?
-	if err := togo(C.AudioQueueNewOutput(
+
+	p.cref = globalRefs.getRef(p)
+
+	if err := togo(C.audioQueueNewOutputWrap(
 		&inFormat,
-		(*[0]byte)(unsafe.Pointer(C.addr())),
-		unsafe.Pointer(p), // User data
-		nil,               // Run on audio queue's thread
-		nil,               // Callback run loop's mode
-		0,                 // Reserved
+		p.cref, // User data
 		&p.queue)); err != nil {
 		return err
 	}
@@ -182,7 +233,7 @@ func (p *ALACPlayer) Start() error {
 			p.queue, alac_buffer_size, alac_num_packets, &p.buffers[i])); err != nil {
 			return err
 		}
-		Go_callback(unsafe.Pointer(p), p.queue, p.buffers[i])
+		startCallback(p, p.queue, p.buffers[i])
 	}
 	if err := togo(C.AudioQueueSetParameter(p.queue, C.kAudioQueueParam_Volume, 1.0)); err != nil {
 		return err
